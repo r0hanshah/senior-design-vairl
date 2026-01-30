@@ -173,7 +173,7 @@ def train():
     reward_model = AIRLReward()
 
     policy_opt = optim.Adam(policy.parameters(), lr=3e-4)
-    reward_opt = optim.Adam(reward_model.parameters(), lr=1e-4)
+    reward_opt = optim.Adam(reward_model.parameters(), lr=1e-2)
 
     expert_trajs = generate_expert_trajectories()
 
