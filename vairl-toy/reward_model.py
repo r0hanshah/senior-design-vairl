@@ -41,12 +41,12 @@ class RewardModel(nn.Module): # Essentially the discriminator
 
 def reward_loss(reward_model: RewardModel, expert_states, policy_states, beta=0.01):
     expert_r, mu_e, logvar_e = reward_model(expert_states) # r, mu, logvar
-    policy_r, _, _ = reward_model(policy_states)
+    policy_r, mu_p, logvar_p = reward_model(policy_states)
 
     # Adversarial loss
-    loss_disc = -(
-        F.binary_cross_entropy_with_logits(expert_r, torch.ones_like(expert_r)) -
-        F.binary_cross_entropy_with_logits(policy_r, torch.zeros_like(policy_r))
+    loss_disc = (
+        F.binary_cross_entropy_with_logits(logvar_e, torch.ones_like(logvar_e)) +
+        F.binary_cross_entropy_with_logits(logvar_p, torch.zeros_like(logvar_p))
     )
 
     # KL regularization
