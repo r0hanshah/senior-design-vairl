@@ -182,7 +182,7 @@ def train():
     reward_model = AIRLReward()
 
     policy_opt = optim.Adam(policy.parameters(), lr=3e-4)
-    reward_opt = optim.Adam(reward_model.parameters(), lr=1e-4)
+    reward_opt = optim.Adam(reward_model.parameters(), lr=1e-2)
 
     expert_trajs = generate_expert_trajectories()
 
@@ -190,11 +190,10 @@ def train():
         policy_trajs = rollout_policy(policy)
 
         # Reward update
-        if it % 4 == 0:
-            reward_opt.zero_grad()
-            r_loss = reward_loss(reward_model, expert_trajs, policy_trajs)
-            r_loss.backward()
-            reward_opt.step()
+        reward_opt.zero_grad()
+        r_loss = reward_loss(reward_model, expert_trajs, policy_trajs)
+        r_loss.backward()
+        reward_opt.step()
 
         # Policy update
         policy_opt.zero_grad()
