@@ -6,11 +6,14 @@ One file to represent the following:
 """
 
 import numpy as np
+import gym
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import matplotlib.pyplot as plt
+
+from sb3_contrib import TRPO
 
 # Environment
 GRID_MIN = -10
@@ -23,6 +26,59 @@ RANDOM_SPAWN_MAX_X = -2
 RANDOM_SPAWN_MAX_Y = -2
 
 GOAL = np.array([5, 5])
+
+class VDBEnv(gym.Env):
+    """
+    Gym environment necessary to conduct TRPO to optimize the generator policy.
+    """
+    def __init__(self, encoder, discriminator):
+        super().__init__()
+
+        self.encoder = encoder
+        self.discriminator = discriminator
+
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32
+        )
+
+        self.action_space = gym.spaces.Box(
+            low=-1.0, high=1.0, shape=(2,), dtype=np.float32
+        )
+
+        self.state = None
+
+    def reset(self):
+        self.state = np.array([
+            np.random.uniform(RANDOM_SPAWN_MIN_X, RANDOM_SPAWN_MAX_X),
+            np.random.uniform(RANDOM_SPAWN_MIN_Y, RANDOM_SPAWN_MAX_Y)
+        ])
+        return self.state
+
+    def step(self, action):
+        x, y = self.state
+        dx, dy = action
+        x_n = x + dx
+        y_n = y + dy
+
+        # VDB REWARD
+
+        with torch.no_grad():
+
+            z, _mu, _logvar = self.encoder(
+                torch.tensor(x),
+                torch.tensor(y),
+                torch.tensor(x_n),
+                torch.tensor(y_n)
+            )
+
+            logits = self.discriminator(z)
+
+            reward = torch.log(torch.sigmoid(logits) + 1e-8).item()
+
+        self.state = next_state
+        done = False # TODO: Understand why this is okay...
+
+        return next_state, reward, done, {}
 
 # Movement
 MAX_STEP_COUNT = 40
@@ -88,7 +144,7 @@ class Generator(nn.Module):
     def forward(self, state: np.array):
         return self.net(state)
 
-def generate_generator_trajectories(generator: Generator, n_trajs:int = 10) -> list:
+def generate_generator_trajectories(generator: TRPO, env: VDBEnv, n_trajs:int = 10) -> list:
     """
     Generate trajectories through the generator.
     """
@@ -96,23 +152,21 @@ def generate_generator_trajectories(generator: Generator, n_trajs:int = 10) -> l
 
     for _ in range(n_trajs):
 
-        state = np.array([
-            np.random.uniform(RANDOM_SPAWN_MIN_X, RANDOM_SPAWN_MAX_X),
-            np.random.uniform(RANDOM_SPAWN_MIN_Y, RANDOM_SPAWN_MAX_Y)
-        ])
+        state = env.reset()
 
         traj = []
 
         for _ in range(MAX_STEP_COUNT):
 
-            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-
-            action = generator(state_tensor).squeeze(0).detach().numpy()
-            next_state = step(state, action)
+            action, _ = generator.predict(state, deterministic=False)
+            next_state, _reward, _done, _ = env.step(action)
 
             traj.append((state.copy(), action.copy(), next_state.copy()))
 
             state = next_state
+
+            if done:
+                state = env.reset()
 
         trajectories.append(traj)
 
@@ -161,7 +215,7 @@ class Encoder(nn.Module):
 # KL divergence function that serves as an upper bound for I(X, Z)
 # I(X, Z) <= E[KL[E(z|x)||r(z)]] s.t. r(z) = N(0,I) & E(z|x) = N(u_E(x), SIGMA_E(x))
 
-BETA = torch.tensor(1.0) # Lagrange multiplier
+BETA = torch.tensor(1.0, requires_grad=True) # Lagrange multiplier
 I_C = 0.5 # Upper bound on the mutual information between the encoding and the original features I(X, Z)
 BETA_STEP_SIZE = 1e-3 # Step size for updating the dual variable BETA
 
@@ -208,7 +262,16 @@ class Discriminator(nn.Module):
         return self.net(z)
 
 
+# TRPO IS GENERATOR
+
+
+
 NUM_EPISODES = 200
+ROLLOUT_STEPS = MAX_STEP_COUNT
+
+GENERATOR_LEARNING_RATE = 1e-3
+DISCRIMINATOR_LEARNING_RATE= 1e-3
+ENCODER_LEARNING_RATE = 1e-3
 
 def main():
     """
@@ -219,19 +282,34 @@ def main():
 
     # Instantiate main components
 
-    # TODO: How many optimizers do we need? Do we need one for the encoder?
-
-    generator = Generator()
+    env = VDBEnv(encoder, discriminator)
+    generator = TRPO(
+        policy = "MlpPolicy",
+        env = env,
+        learning_rate = GENERATOR_LEARNING_RATE,
+        batch_size = 2048, # Paper suggests 10,000
+        gamma = 0.99,
+        gae_lambda = 0.95, # Stabalize advantage estimation
+        target_kl = 0.01, # TRPO trust region
+        verbose = True,
+    )
     encoder = Encoder()
     discriminator = Discriminator()
+
+    # Instantiate optimizers
+    enc_opt = torch.optim.Adam(encoder.parameters(), lr=ENCODER_LEARNING_RATE)
+    disc_opt = torch.optim.Adam(discriminator.parameters(), lr=ENCODER_LEARNING_RATE)
 
     # Generate expert data
     exp_data = generate_expert_trajectories()
 
     for _ in range(NUM_EPISODES):
 
+        # TRPO update a.k.a. updating the Generator Policy
+        generator.learn(total_timesteps=ROLLOUT_STEPS)
+
         # Generate generator data
-        gen_data = generate_generator_trajectories(generator)
+        gen_data = generate_generator_trajectories(generator, env)
 
         # DATA -> ENCODER
         
@@ -258,14 +336,8 @@ def main():
 
         # Map generator data to latent space and get reward
 
-        gen_rewards = []
-        gen_states = []
-        gen_actions = []
-
         for traj in gen_data:
             
-            traj_rewards = []
-
             for step in traj:
 
                 state, action, next_state = step
@@ -274,31 +346,11 @@ def main():
 
                 z, mu, logvar = encoder(x, y, x_n, y_n)
 
-                # Get reward for generator
-                logit = discriminator(z)
-                reward = -F.logsigmoid(-logit) #= -log(sigmoid(logit))
-                reward = reward.detach()
-                traj_rewards.append(reward.squeeze())
-
-                gen_states.append(state)
-                gen_actions.append(action)
-
                 z_list.append(z)
                 labels.append(torch.zeros(z.size(0), 1)) # generator = 0
 
                 kl_list.append(kl_divergence(mu, logvar))
 
-            gen_rewards.append(traj_rewards)
-
-        
-        # REINFORCE-STYLE GENERATOR UPDATE
-        generator_loss = 0.0
-
-        for traj_states, traj_actions, traj_rewards in zip(gen_states, gen_actions, gen_rewards):
-
-            returns = None # TODO: How to compute returns for PPO update to generator
-
-        
         z_batch = torch.cat(z_list, dim=0)
         label_batch = torch.cat(labels, dim=0)
         kl_batch = torch.cat(kl_list, dim=0)
@@ -311,10 +363,19 @@ def main():
 
         discriminator_loss = F.binary_cross_entropy_with_logits(logits, label_batch)
 
-        loss = discriminator_loss + beta * (kl - I_c)
+        encoder_loss = discriminator_loss + beta * (kl - I_c)
+
+        # Update DISCRIMINATOR
+        disc_opt.zero_grad()
+        discriminator_loss.backward()
+        disc_opt.step()
+
+        # Update ENCODER
+        enc_opt.zero_grad()
+        encoder_loss.backward()
+        enc_opt.step()
 
         # Update lagrange multiplier (beta)
-
         update_beta(beta, kl)
 
         exit()
