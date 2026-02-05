@@ -321,9 +321,16 @@ def main():
         print(f"EPISODE {i}")
         generator.learn(total_timesteps=ROLLOUT_STEPS)
 
-        print(f"Policy KL    : {generator.logger.name_to_value['train/approx_kl']}")
-        print(f"Entropy      : {generator.logger.name_to_value['train/entropy_loss']}")
+        logger = generator.logger.name_to_value
 
+        for k in [
+            "train/kl_divergence_loss",
+            "train/is_line_search_success",
+            "train/std",
+            "train/policy_objective",
+            "train/explained_variance",
+        ]:
+            print(k, logger.get(k))
 
         # Generate generator data
         gen_data = generate_generator_trajectories(generator, env)
