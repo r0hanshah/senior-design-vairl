@@ -46,19 +46,21 @@ class VDBEnv(gym.Env):
         )
 
         self.state = None
+        self.t = 0 
 
     def reset(self):
         self.state = np.array([
             np.random.uniform(RANDOM_SPAWN_MIN_X, RANDOM_SPAWN_MAX_X),
             np.random.uniform(RANDOM_SPAWN_MIN_Y, RANDOM_SPAWN_MAX_Y)
         ])
+        self.t = 0
         return self.state
 
     def step(self, action):
+        self.t += 1
         x, y = self.state
         dx, dy = action
-        x_n = x + dx
-        y_n = y + dy
+        next_state = np.array([x + dx, y + dy])
 
         # VDB REWARD
 
@@ -67,16 +69,17 @@ class VDBEnv(gym.Env):
             z, _mu, _logvar = self.encoder(
                 torch.tensor(x),
                 torch.tensor(y),
-                torch.tensor(x_n),
-                torch.tensor(y_n)
+                torch.tensor(next_state[0]),
+                torch.tensor(next_state[1])
             )
 
             logits = self.discriminator(z)
 
-            reward = torch.log(torch.sigmoid(logits) + 1e-8).item()
+            reward = torch.log(torch.sigmoid(logits) + 1e-8)
+            reward = torch.clamp(reward, -10.0, 10.0).item()
 
         self.state = next_state
-        done = False # TODO: Understand why this is okay...
+        done = self.t >= MAX_STEP_COUNT 
 
         return next_state, reward, done, {}
 
@@ -149,17 +152,21 @@ def generate_generator_trajectories(generator: TRPO, env: VDBEnv, n_trajs:int = 
     Generate trajectories through the generator.
     """
     trajectories = []
+    rewards = []
 
     for _ in range(n_trajs):
 
         state = env.reset()
 
         traj = []
+        reward_accumulated = 0
 
         for _ in range(MAX_STEP_COUNT):
 
             action, _ = generator.predict(state, deterministic=False)
-            next_state, _reward, _done, _ = env.step(action)
+            next_state, reward, done, _ = env.step(action)
+
+            reward_accumulated += reward
 
             traj.append((state.copy(), action.copy(), next_state.copy()))
 
@@ -168,7 +175,11 @@ def generate_generator_trajectories(generator: TRPO, env: VDBEnv, n_trajs:int = 
             if done:
                 state = env.reset()
 
+        rewards.append(reward_accumulated)
         trajectories.append(traj)
+
+    print(f"Reward mean  : {np.mean(rewards):.3f}")
+    print(f"Reward std   : {np.std(rewards):.3f}")
 
     return trajectories
 
@@ -198,7 +209,7 @@ class Encoder(nn.Module):
 
     def forward(self, x:float, y:float, x_next:float, y_next:float):
 
-        h = torch.cat([x, y, x_next, y_next], dim=-1)
+        h = torch.stack((x, y, x_next, y_next)).unsqueeze(0).to(torch.float32)
         h = self.net(h)
 
         mu = self.mu(h)
@@ -267,7 +278,7 @@ class Discriminator(nn.Module):
 
 
 NUM_EPISODES = 200
-ROLLOUT_STEPS = MAX_STEP_COUNT
+ROLLOUT_STEPS = 2048
 
 GENERATOR_LEARNING_RATE = 1e-3
 DISCRIMINATOR_LEARNING_RATE= 1e-3
@@ -282,6 +293,9 @@ def main():
 
     # Instantiate main components
 
+    encoder = Encoder()
+    discriminator = Discriminator()
+    
     env = VDBEnv(encoder, discriminator)
     generator = TRPO(
         policy = "MlpPolicy",
@@ -293,8 +307,6 @@ def main():
         target_kl = 0.01, # TRPO trust region
         verbose = True,
     )
-    encoder = Encoder()
-    discriminator = Discriminator()
 
     # Instantiate optimizers
     enc_opt = torch.optim.Adam(encoder.parameters(), lr=ENCODER_LEARNING_RATE)
@@ -303,10 +315,15 @@ def main():
     # Generate expert data
     exp_data = generate_expert_trajectories()
 
-    for _ in range(NUM_EPISODES):
+    for i in range(NUM_EPISODES):
 
         # TRPO update a.k.a. updating the Generator Policy
+        print(f"EPISODE {i}")
         generator.learn(total_timesteps=ROLLOUT_STEPS)
+
+        print(f"Policy KL    : {generator.logger.name_to_value['train/approx_kl']}")
+        print(f"Entropy      : {generator.logger.name_to_value['train/entropy_loss']}")
+
 
         # Generate generator data
         gen_data = generate_generator_trajectories(generator, env)
@@ -327,7 +344,12 @@ def main():
                  x, y = state
                  x_n, y_n = next_state
 
-                 z, mu, logvar = encoder(x, y, x_n, y_n)
+                 z, mu, logvar = encoder(
+                     torch.tensor(x, dtype=torch.float32), 
+                     torch.tensor(y, dtype=torch.float32), 
+                     torch.tensor(x_n, dtype=torch.float32), 
+                     torch.tensor(y_n, dtype=torch.float32)
+                )
 
                  z_list.append(z)
                  labels.append(torch.ones(z.size(0), 1)) # expert = 1
@@ -344,7 +366,12 @@ def main():
                 x, y = state
                 x_n, y_n = next_state
 
-                z, mu, logvar = encoder(x, y, x_n, y_n)
+                z, mu, logvar = encoder(
+                     torch.tensor(x, dtype=torch.float32), 
+                     torch.tensor(y, dtype=torch.float32), 
+                     torch.tensor(x_n, dtype=torch.float32), 
+                     torch.tensor(y_n, dtype=torch.float32)
+                )
 
                 z_list.append(z)
                 labels.append(torch.zeros(z.size(0), 1)) # generator = 0
@@ -355,30 +382,59 @@ def main():
         label_batch = torch.cat(labels, dim=0)
         kl_batch = torch.cat(kl_list, dim=0)
 
-        # ENCODER -> DISCRIMINATOR
-        
-        kl = kl_batch.mean()
-        
-        logits = discriminator(z_batch)
+        # DISCRIMINATOR
 
+        z_detached = z_batch.detach()
+
+        logits = discriminator(z_detached)
+        
         discriminator_loss = F.binary_cross_entropy_with_logits(logits, label_batch)
+       
+        with torch.no_grad():
+            probs = torch.sigmoid(logits)
+            expert_acc = (probs[label_batch == 1] > 0.5).float().mean()
+            gen_acc = (probs[label_batch == 0] < 0.5).float().mean()
 
-        encoder_loss = discriminator_loss + beta * (kl - I_c)
+        print(f"D loss       : {discriminator_loss.item():.4f}")
+        print(f"D acc expert : {expert_acc.item():.3f}")
+        print(f"D acc gen    : {gen_acc.item():.3f}")
 
-        # Update DISCRIMINATOR
+
+        # DISCRIMINATOR UPDATE
         disc_opt.zero_grad()
         discriminator_loss.backward()
         disc_opt.step()
+        
+        # ENCODER UPDATE
 
-        # Update ENCODER
+        for p in discriminator.parameters():
+            p.requires_grad = False
+
+        logits = discriminator(z_batch)
+        
+        kl = kl_batch.mean()
+        
+        encoder_loss = F.binary_cross_entropy_with_logits(logits, label_batch) + beta * (kl - I_C)
+
         enc_opt.zero_grad()
         encoder_loss.backward()
         enc_opt.step()
 
+        print(f"z mean       : {z_batch.mean().item():.3f}")
+        print(f"z std        : {z_batch.std().item():.3f}")
+
+        for p in discriminator.parameters():
+            p.requires_grad = True
+
         # Update lagrange multiplier (beta)
         update_beta(beta, kl)
 
-        exit()
+        print(f"KL(z|x)      : {kl.item():.4f}")
+        print(f"I_c          : {I_C:.4f}")
+        print(f"KL - I_c     : {(kl - I_C).item():.4f}")
+        print(f"beta         : {beta:.4f}")
+
+        
 
 if __name__ == "__main__":
     main()
