@@ -147,7 +147,7 @@ class Generator(nn.Module):
     def forward(self, state: np.array):
         return self.net(state)
 
-def generate_generator_trajectories(generator: TRPO, env: VDBEnv, n_trajs:int = 10) -> list:
+def generate_generator_trajectories(generator: TRPO, env: VDBEnv, n_trajs:int = 20) -> list:
     """
     Generate trajectories through the generator.
     """
@@ -281,7 +281,7 @@ NUM_EPISODES = 200
 ROLLOUT_STEPS = 2048
 
 GENERATOR_LEARNING_RATE = 1e-3
-DISCRIMINATOR_LEARNING_RATE= 1e-3
+DISCRIMINATOR_LEARNING_RATE= 1e-4
 ENCODER_LEARNING_RATE = 1e-3
 
 def main():
@@ -315,10 +315,10 @@ def main():
     # Generate expert data
     exp_data = generate_expert_trajectories()
 
-    for i in range(NUM_EPISODES):
+    for episode in range(NUM_EPISODES):
 
         # TRPO update a.k.a. updating the Generator Policy
-        print(f"EPISODE {i}")
+        print(f"EPISODE {episode}")
         generator.learn(total_timesteps=ROLLOUT_STEPS)
 
         logger = generator.logger.name_to_value
@@ -396,21 +396,30 @@ def main():
         logits = discriminator(z_detached)
         
         discriminator_loss = F.binary_cross_entropy_with_logits(logits, label_batch)
-       
+
         with torch.no_grad():
             probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).float()
+            acc = (preds == label_batch).float().mean().item()
             expert_acc = (probs[label_batch == 1] > 0.5).float().mean()
             gen_acc = (probs[label_batch == 0] < 0.5).float().mean()
 
         print(f"D loss       : {discriminator_loss.item():.4f}")
         print(f"D acc expert : {expert_acc.item():.3f}")
+        print(f"D acc        : {acc:.3f}")
         print(f"D acc gen    : {gen_acc.item():.3f}")
+
+        print("Expert mean prob:",
+              probs[label_batch == 1].mean().item())
+        print("Gen mean prob:",
+              probs[label_batch == 0].mean().item())
 
 
         # DISCRIMINATOR UPDATE
-        disc_opt.zero_grad()
-        discriminator_loss.backward()
-        disc_opt.step()
+        if episode % N == 0:
+            disc_opt.zero_grad()
+            discriminator_loss.backward()
+            disc_opt.step()
         
         # ENCODER UPDATE
 
