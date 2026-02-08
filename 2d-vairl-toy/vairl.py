@@ -279,6 +279,7 @@ class Discriminator(nn.Module):
 
 NUM_EPISODES = 200
 ROLLOUT_STEPS = 2048
+N = 3 # Train discriminator every 3 episodes
 
 GENERATOR_LEARNING_RATE = 1e-3
 DISCRIMINATOR_LEARNING_RATE= 1e-4
