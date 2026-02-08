@@ -17,6 +17,7 @@ import torch.optim as optim
 from sb3_contrib import TRPO
 
 from metrics import MetricsLogger
+from display import plot_expert_vs_generator
 
 
 # Environment
@@ -31,17 +32,36 @@ RANDOM_SPAWN_MAX_Y = -2
 
 GOAL = np.array([5, 5])
 
+# WALL
+
+WALL_X = 2.5
+WALL_Y_MIN = -10
+WALL_Y_MAX = 6.0
+
+def hits_wall(state, next_state):
+
+    if (state[0] < WALL_X <= next_state[0]) or (next_state[0] < WALL_X <= state[0]):
+    
+        t = (WALL_X - state[0]) / (next_state[0] - state[0] + 1e-8)
+        y_cross = state[1] + t * (next_state[1] - state[1])
+
+        if WALL_Y_MIN <= y_cross <= WALL_Y_MAX:
+            return True
+    
+    return False
+
 
 class VDBEnv(gym.Env):
     """
     Gym environment necessary to conduct TRPO to optimize the generator policy.
     """
 
-    def __init__(self, encoder, discriminator):
+    def __init__(self, encoder, discriminator, enable_wall=False):
         super().__init__()
 
         self.encoder = encoder
         self.discriminator = discriminator
+        self.enable_wall = enable_wall
 
         self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32
@@ -71,21 +91,32 @@ class VDBEnv(gym.Env):
         next_state = np.array([x + dx, y + dy])
 
         # VDB REWARD
-        with torch.no_grad():
-            z, _mu, _logvar = self.encoder(
-                torch.tensor(x),
-                torch.tensor(y),
-                torch.tensor(next_state[0]),
-                torch.tensor(next_state[1]),
-            )
+        if self.enable_wall and hits_wall(self.state, next_state):
+            
+            next_state = self.state.copy()
+            reward = -1.0
+        
+        else:
+            
+            with torch.no_grad():
+                z, _mu, _logvar = self.encoder(
+                    torch.tensor(x),
+                    torch.tensor(y),
+                    torch.tensor(next_state[0]),
+                    torch.tensor(next_state[1]),
+                )
 
-            logits = self.discriminator(z)
+                logits = self.discriminator(z)
 
-            reward = torch.log(torch.sigmoid(logits) + 1e-8)
-            reward = torch.clamp(reward, -10.0, 10.0).item()
+                reward = torch.log(torch.sigmoid(logits) + 1e-8)
+                reward = torch.clamp(reward, -10.0, 10.0).item()
 
         self.state = next_state
-        done = self.t >= MAX_STEP_COUNT
+        dist = np.linalg.norm(next_state - GOAL)
+        done = dist < 0.5 or self.t >= MAX_STEP_COUNT
+
+        if done and dist <= 0.5:
+            reward += 1.0
 
         return next_state, reward, done, {}
 
@@ -100,7 +131,92 @@ def step(state: np.array, action: np.array) -> np.array:
 
 
 # DATA
-def generate_expert_trajectories(n_trajs: int = 30):
+def generate_s_shaped_expert_trajectories(
+    n_steps=40,
+    amplitude=1.0,
+    frequency=2.0,
+    n_trajs = 30,
+):
+    trajectories = []
+
+    for _ in range(n_trajs):
+        
+        state = np.array(
+            [
+                np.random.uniform(RANDOM_SPAWN_MIN_X, RANDOM_SPAWN_MAX_X),
+                np.random.uniform(RANDOM_SPAWN_MIN_Y, RANDOM_SPAWN_MAX_Y),
+            ]
+        )
+
+        traj = []
+
+        direction = GOAL - state
+        direction /= np.linalg.norm(direction) + 1e-8
+
+        perp = np.array([-direction[1], direction[0]])
+
+        for t in range(n_steps):
+            alpha = t / n_steps
+
+            # S-shape oscillation
+            offset = amplitude * np.sin(2 * np.pi * frequency * alpha)
+            move_dir = direction + offset * perp
+            move_dir /= np.linalg.norm(move_dir) + 1e-8
+
+            action = MAX_STEP_SIZE * move_dir
+            next_state = step(state, action)
+
+            traj.append((state.copy(), action.copy(), next_state.copy()))
+            state = next_state
+
+        trajectories.append(traj)
+
+    return trajectories
+
+
+def generate_curved_expert_trajectories(
+    n_steps=40,
+    curvature=10,
+    n_trajs=30
+):
+    trajectories = []
+
+    for _ in range(n_trajs):
+        
+        state = np.array(
+            [
+                np.random.uniform(RANDOM_SPAWN_MIN_X, RANDOM_SPAWN_MAX_X),
+                np.random.uniform(RANDOM_SPAWN_MIN_Y, RANDOM_SPAWN_MAX_Y),
+            ]
+        )
+
+        traj = []
+
+
+        for t in range(n_steps):
+            alpha = t / n_steps
+
+            direction = GOAL - state
+            perp = np.array([-direction[1], direction[0]])
+            perp /= np.linalg.norm(perp) + 1e-8
+        
+            # Curved direction
+            curve_offset = curvature * np.sin(np.pi * alpha)
+            move_dir = direction + curve_offset * perp
+            move_dir /= np.linalg.norm(move_dir) + 1e-8
+
+            action = MAX_STEP_SIZE * move_dir
+            next_state = step(state, action)
+
+            traj.append((state.copy(), action.copy(), next_state.copy()))
+            state = next_state
+
+        trajectories.append(traj)
+
+    return trajectories
+
+
+def generate_straight_expert_trajectories(n_trajs: int = 30):
     """
     Generate an array of trajectories that serve as expert demonstrations.
     """
@@ -248,7 +364,7 @@ def update_beta(beta, kl):
     Update the lagrange multiplier beta.
     """
     with torch.no_grad():
-        beta += BETA_STEP_SIZE * (kl.detach() - I_C)
+        beta += BETA_STEP_SIZE * (kl.detach().detach() - I_C)
         beta.clamp_(min=0)
 
 
@@ -268,7 +384,9 @@ class Discriminator(nn.Module):
             nn.ReLU(),
             nn.Linear(D_HIDDEN_SIZE, D_HIDDEN_SIZE),
             nn.ReLU(),
-            nn.Linear(D_HIDDEN_SIZE, 1),  # logit
+            nn.Linear(D_HIDDEN_SIZE, D_HIDDEN_SIZE//2),
+            nn.ReLU(),
+            nn.Linear(D_HIDDEN_SIZE//2, 1),  # logit
         )
 
     def forward(self, z):
@@ -277,11 +395,11 @@ class Discriminator(nn.Module):
 
 NUM_EPISODES = 200
 ROLLOUT_STEPS = 2048
-N = 3 # Train discriminator every 3 episodes
+N = 5 # Train discriminator every N episodes
 
 GENERATOR_LEARNING_RATE = 1e-3
-DISCRIMINATOR_LEARNING_RATE = 1e-4
-ENCODER_LEARNING_RATE = 1e-3
+DISCRIMINATOR_LEARNING_RATE = 1e-6
+ENCODER_LEARNING_RATE = 1e-2
 
 # How often to save metrics snapshots
 SAVE_EVERY = 10
@@ -292,6 +410,9 @@ def main():
     Training loop.
     """
 
+    path_type = input("\nChoose expert path type:\n- s: S-Curve\n- c: C-Curve\n- else: Straight\n\nChoice: ")
+    enable_wall = path_type == "c"
+
     out_dir = Path("metrics_out")
     metrics = MetricsLogger()
 
@@ -300,7 +421,7 @@ def main():
     encoder = Encoder()
     discriminator = Discriminator()
 
-    env = VDBEnv(encoder, discriminator)
+    env = VDBEnv(encoder, discriminator, enable_wall)
     generator = TRPO(
         policy="MlpPolicy",
         env=env,
@@ -315,7 +436,12 @@ def main():
     enc_opt = torch.optim.Adam(encoder.parameters(), lr=ENCODER_LEARNING_RATE)
     disc_opt = torch.optim.Adam(discriminator.parameters(), lr=ENCODER_LEARNING_RATE)
 
-    exp_data = generate_expert_trajectories()
+    if path_type == "s":
+        exp_data = generate_s_shaped_expert_trajectories()
+    elif path_type == "c":
+        exp_data = generate_curved_expert_trajectories()
+    else:
+        exp_data = generate_straight_expert_trajectories()
 
     for episode in range(NUM_EPISODES):
         print(f"EPISODE {episode}")
@@ -397,7 +523,7 @@ def main():
         print("Expert mean prob:", probs[label_batch == 1].mean().item())
         print("Gen mean prob:", probs[label_batch == 0].mean().item())
 
-        # DISCRIMINATOR UPDATE (your old code used N; keep it simple: always update)
+        # DISCRIMINATOR UPDATE
         disc_opt.zero_grad()
         discriminator_loss.backward()
         disc_opt.step()
@@ -453,6 +579,7 @@ def main():
         metrics.log("beta", float(beta))
 
         if (episode + 1) % SAVE_EVERY == 0:
+            plot_expert_vs_generator(exp_data, gen_data, GOAL, [WALL_X, WALL_Y_MIN, WALL_Y_MAX])
             metrics.save_all(out_dir, show=False)
 
     metrics.save_all(out_dir, show=True)
