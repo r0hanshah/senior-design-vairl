@@ -348,14 +348,15 @@ class Encoder(nn.Module):
 
 BETA = torch.tensor(1.0, requires_grad=True)  # Lagrange multiplier
 I_C = 0.5  # Upper bound on the mutual information between the encoding and the original features I(X, Z)
-BETA_STEP_SIZE = 1e-3  # Step size for updating the dual variable BETA
+BETA_STEP_SIZE = 1e-2  # Step size for updating the dual variable BETA
 
 
 def kl_divergence(mu, logvar):
     """
     Calculate the KL divergence.
     """
-    kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
+    # kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
+    kl = 0.5 * torch.sum(mu.pow(2) + logvar.exp() - logvar - 1, dim=1) 
     return kl
 
 
@@ -366,6 +367,7 @@ def update_beta(beta, kl):
     with torch.no_grad():
         beta += BETA_STEP_SIZE * (kl.detach().detach() - I_C)
         beta.clamp_(min=0)
+        #beta = max(0, BETA_STEP_SIZE * (kl.detach().detach() - I_C))
 
 
 D_HIDDEN_SIZE = 128
@@ -398,7 +400,7 @@ ROLLOUT_STEPS = 2048
 N = 5 # Train discriminator every N episodes
 
 GENERATOR_LEARNING_RATE = 1e-3
-DISCRIMINATOR_LEARNING_RATE = 1e-6
+DISCRIMINATOR_LEARNING_RATE = 1e-4
 ENCODER_LEARNING_RATE = 1e-2
 
 # How often to save metrics snapshots
@@ -434,7 +436,7 @@ def main():
     )
 
     enc_opt = torch.optim.Adam(encoder.parameters(), lr=ENCODER_LEARNING_RATE)
-    disc_opt = torch.optim.Adam(discriminator.parameters(), lr=ENCODER_LEARNING_RATE)
+    disc_opt = torch.optim.Adam(discriminator.parameters(), lr=DISCRIMINATOR_LEARNING_RATE)
 
     if path_type == "s":
         exp_data = generate_s_shaped_expert_trajectories()
@@ -579,7 +581,7 @@ def main():
         metrics.log("beta", float(beta))
 
         if (episode + 1) % SAVE_EVERY == 0:
-            plot_expert_vs_generator(exp_data, gen_data, GOAL, [WALL_X, WALL_Y_MIN, WALL_Y_MAX])
+            plot_expert_vs_generator(exp_data, gen_data, GOAL, [WALL_X, WALL_Y_MIN, WALL_Y_MAX] if enable_wall else None)
             metrics.save_all(out_dir, show=False)
 
     metrics.save_all(out_dir, show=True)
